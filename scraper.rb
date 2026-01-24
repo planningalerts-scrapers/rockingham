@@ -38,7 +38,7 @@ class Scraper
     end
   end
 
-  def extract_address_from_details(agent, info_url, fallback_address)
+  def extract_address_from_details(agent, info_url, address_snippet)
     puts "  Pausing #{@pause_duration}s"
     sleep(@pause_duration)
 
@@ -47,45 +47,51 @@ class Scraper
     detail_page = agent.get(info_url)
     @pause_duration = (Time.now.to_f - start_time + 0.5).round(3)
 
-    # Look for patterns like "Lot 160 (No.48) Lookout Vista, Singleton"
-    # or "No.38 Emerald Court, Singleton"
-    # or "Lot 1023 (No.47) Young Road, Baldivis"
-    content = detail_page.search("div.content-main").text
+    # Look for the Proposal section
+    proposal_heading = detail_page.search("h2").find { |h2| h2.text.strip =~ /\AProposal\z/i }
 
-    # Pattern 1: Lot XXX (No.YY) Street, Suburb
-    if content =~ /Lot\s+\d+\s+\(No\.(\d+)\)\s+([^,\.]+),\s*([^,\.]+)/i
-      street_no = ::Regexp.last_match(1)
-      street = ::Regexp.last_match(2).strip
-      suburb = ::Regexp.last_match(3).strip
-      address = "#{street_no} #{street}, #{suburb}, #{STATE}"
-      puts "  Extracted address: #{address}"
+    unless proposal_heading
+      puts "  No Proposal section found"
+      return nil
+    end
+
+    # Get the next paragraph after the Proposal heading
+    next_p = proposal_heading.next_element
+    next_p = next_p.next_element while next_p && next_p.name != "p"
+
+    unless next_p
+      puts "  No paragraph after Proposal heading"
+      return nil
+    end
+
+    content = next_p.text
+    escaped_snippet = Regexp.escape(address_snippet)
+
+    puts "Matching address snippet: #{address_snippet.inspect}",
+         "in paragraph: #{content.inspect}" if ENV['DEBUG']
+
+    # Match address snippet with "No. NN" (optionally surrounded by brackets, optionally preceded by a Lot
+    if content =~ /(Lot\s*\d\w*\s+)?\(?No\.([^\)]+)\)?(.*?#{escaped_snippet})/i
+      lot = ::Regexp.last_match(1)&.strip
+      street_no = ::Regexp.last_match(2).strip
+      remaining_address = ::Regexp.last_match(3).strip
+      address = "#{lot ? "#{lot}, " : ""}#{street_no} #{remaining_address}"
+      puts "  Extracted street address: #{address}" if ENV['DEBUG']
       return address
     end
 
-    # Pattern 2: No.XX Street, Suburb
-    if content =~ /\bNo\.(\d+)\s+([^,\.]+),\s*([^,\.]+)/i
-      street_no = ::Regexp.last_match(1)
-      street = ::Regexp.last_match(2).strip
-      suburb = ::Regexp.last_match(3).strip
-      address = "#{street_no} #{street}, #{suburb}, #{STATE}"
-      puts "  Extracted address: #{address}"
+    # Match address snippet with "Lot"
+    if content =~ /(Lot.*?#{escaped_snippet})/i
+      address = ::Regexp.last_match(1)&.strip
+      puts "  Extracted Lot address: #{address}" if ENV['DEBUG']
       return address
     end
 
-    # Pattern 3: Lot XXXX Street, Suburb (without No.)
-    if content =~ /Lot\s+\d+\s+([^,\.]+),\s*([^,\.]+)/i
-      street = ::Regexp.last_match(1).strip
-      suburb = ::Regexp.last_match(2).strip
-      address = "#{street}, #{suburb}, #{STATE}"
-      puts "  Extracted address: #{address}"
-      return address
-    end
-
-    puts "  Using fallback address: #{fallback_address}"
-    fallback_address
+    puts "  Unable to find full address ending in #{address_snippet.inspect}"
+    nil
   rescue StandardError => e
     puts "  Error fetching detail page #{info_url}: #{e.message}"
-    fallback_address
+    nil
   end
 
   def run
@@ -135,8 +141,8 @@ class Scraper
       end
 
       # Fetch detail page to get better address
-      fallback_address = "#{address_snippet}, #{STATE}"
-      address = extract_address_from_details(agent, info_url, fallback_address)
+      address = extract_address_from_details(agent, info_url, address_snippet) || address_snippet
+      address = "#{address}, #{STATE}" unless address.end_with?(" #{STATE}")
 
       record = {
         "council_reference" => council_reference,
