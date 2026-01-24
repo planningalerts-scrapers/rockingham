@@ -67,23 +67,25 @@ class Scraper
     content = next_p.text
     escaped_snippet = Regexp.escape(address_snippet)
 
-    puts "Matching address snippet: #{address_snippet.inspect}",
-         "in paragraph: #{content.inspect}" if ENV['DEBUG']
+    if ENV["DEBUG"]
+      puts "Matching address snippet: #{address_snippet.inspect}",
+           "in paragraph: #{content.inspect}"
+    end
 
     # Match address snippet with "No. NN" (optionally surrounded by brackets, optionally preceded by a Lot
-    if content =~ /(Lot\s*\d\w*\s+)?\(?No\.([^\)]+)\)?(.*?#{escaped_snippet})/i
+    if content =~ /(Lot\s*\d\w*\s+)?\(?No\.([^)]+)\)?(.*?#{escaped_snippet})/i
       lot = ::Regexp.last_match(1)&.strip
       street_no = ::Regexp.last_match(2).strip
       remaining_address = ::Regexp.last_match(3).strip
-      address = "#{lot ? "#{lot}, " : ""}#{street_no} #{remaining_address}"
-      puts "  Extracted street address: #{address}" if ENV['DEBUG']
+      address = "#{lot ? "#{lot}, " : ''}#{street_no} #{remaining_address}"
+      puts "  Extracted street address: #{address}" if ENV["DEBUG"]
       return address
     end
 
     # Match address snippet with "Lot"
     if content =~ /(Lot.*?#{escaped_snippet})/i
       address = ::Regexp.last_match(1)&.strip
-      puts "  Extracted Lot address: #{address}" if ENV['DEBUG']
+      puts "  Extracted Lot address: #{address}" if ENV["DEBUG"]
       return address
     end
 
@@ -135,9 +137,7 @@ class Scraper
       para = card.at("p")
       if para
         text = clean_whitespace(para.text)
-        if text =~ /Submissions close\s+(.+)\./
-          on_notice_to = parse_date(::Regexp.last_match(1))
-        end
+        on_notice_to = parse_date(::Regexp.last_match(1)) if text =~ /Submissions close\s+(.+)\./
       end
 
       # Fetch detail page to get better address
