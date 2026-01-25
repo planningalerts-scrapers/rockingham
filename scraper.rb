@@ -27,8 +27,8 @@ class Scraper
   end
 
   def generate_council_reference(title)
-    # Sanitize: replace non-alphanumeric with space, squeeze, strip
-    sanitized = title.gsub(/[^A-Za-z0-9]+/, " ").squeeze(" ").strip
+    # Sanitize: replace non-alphanumeric characters with space, strip
+    sanitized = title.gsub(/[^A-Za-z0-9]+/, " ").strip
 
     # Truncate to 49 chars and add hyphen if truncated
     if sanitized.length > 49
