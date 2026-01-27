@@ -9,12 +9,6 @@ class Scraper
   LISTING_URL = "#{BASE_URL}/planning-and-building/local-planning/town-planning-advertising-and-submissions"
   STATE = "WA"
 
-  attr_accessor :pause_duration
-
-  def initialize
-    @pause_duration = 0.0
-  end
-
   def clean_whitespace(text)
     text.gsub("\r", " ").gsub("\n", " ").squeeze(" ").strip
   end
@@ -24,6 +18,43 @@ class Scraper
     Date.parse(date_string).to_s
   rescue ArgumentError
     nil
+  end
+
+  # Throttle block to be nice to servers we are scraping
+  def throttle_block(extra_delay: 0.5)
+    if @pause_duration
+      puts "  Pausing #{@pause_duration}s"
+      sleep(@pause_duration)
+    end
+    start_time = Time.now.to_f
+    page = yield
+    @pause_duration = (Time.now.to_f - start_time + extra_delay).round(3)
+    page
+  end
+
+  # Cleanup and vacuum database of old records (planning alerts only looks at last 5 days)
+  def cleanup_old_records
+    cutoff_date = (Date.today - 30).to_s
+    vacuum_cutoff_date = (Date.today - 35).to_s
+
+    stats = ScraperWiki.sqliteexecute(
+      "SELECT COUNT(*) as count, MIN(date_scraped) as oldest FROM data WHERE date_scraped < ?",
+      [cutoff_date]
+    ).first
+
+    deleted_count = stats["count"]
+    oldest_date = stats["oldest"]
+
+    return unless deleted_count.positive? || ENV["VACUUM"]
+
+    puts "Deleting #{deleted_count} applications scraped between #{oldest_date} and #{cutoff_date}"
+    ScraperWiki.sqliteexecute("DELETE FROM data WHERE date_scraped < ?", [cutoff_date])
+
+    # VACUUM roughly once each 33 days or if older than 35 days (first time) or if VACUUM is set
+    return unless rand < 0.03 || (oldest_date && oldest_date < vacuum_cutoff_date) || ENV["VACUUM"]
+
+    puts "  Running VACUUM to reclaim space..."
+    ScraperWiki.sqliteexecute("VACUUM")
   end
 
   def generate_council_reference(title)
@@ -39,13 +70,10 @@ class Scraper
   end
 
   def extract_address_from_details(agent, info_url, address_snippet)
-    puts "  Pausing #{@pause_duration}s"
-    sleep(@pause_duration)
-
-    puts "  Fetching detail page: #{info_url}"
-    start_time = Time.now.to_f
-    detail_page = agent.get(info_url)
-    @pause_duration = (Time.now.to_f - start_time + 0.5).round(3)
+    detail_page = throttle_block do
+      puts "  Fetching detail page: #{info_url}"
+      agent.get(info_url)
+    end
 
     # Look for the Proposal section
     proposal_heading = detail_page.search("h2").find { |h2| h2.text.strip =~ /\AProposal\z/i }
@@ -100,10 +128,10 @@ class Scraper
     agent = Mechanize.new
     agent.verify_mode = OpenSSL::SSL::VERIFY_NONE
 
-    puts "Getting listing page"
-    start_time = Time.now.to_f
-    page = agent.get(LISTING_URL)
-    @pause_duration = (Time.now.to_f - start_time + 0.5).round(3)
+    page = throttle_block do
+      puts "Getting listing page"
+      agent.get(LISTING_URL)
+    end
 
     cards = page.search("a.hotbox")
     added = found = 0
@@ -158,16 +186,7 @@ class Scraper
       ScraperWiki.save_sqlite(["council_reference"], record)
     end
 
-    # Clean up applications older than 30 days
-    cutoff_date = (Date.today - 30).to_s
-    puts "Deleting applications scraped before #{cutoff_date}"
-    deleted_count = ScraperWiki.sqliteexecute(
-      "SELECT COUNT(*) FROM data WHERE date_scraped < ?",
-      [cutoff_date]
-    ).first.values.first
-    ScraperWiki.sqliteexecute("DELETE FROM data WHERE date_scraped < ?", [cutoff_date])
-
-    puts "  Deleted #{deleted_count} applications" if deleted_count.positive?
+    cleanup_old_records
     skipped = found - added
     puts "Finished! Added #{added} applications, and skipped #{skipped} unprocessable applications."
   end
