@@ -9,7 +9,7 @@ require "mechanize"
 
 class Scraper
   BASE_URL = "https://rockingham.wa.gov.au"
-  LISTING_URL = "#{BASE_URL}/planning-and-building/local-planning/town-planning-advertising-and-submissions"
+  LISTING_URL = "https://yourthoughts.rockingham.wa.gov.au/town-planning-advertising-and-submissions"
   STATE = "WA"
 
   def clean_whitespace(text)
