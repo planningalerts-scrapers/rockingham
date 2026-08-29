@@ -7,10 +7,15 @@ Bundler.require
 require "scraperwiki"
 require "mechanize"
 
+# Scrapes advertised town planning applications from the City of Rockingham's
+# Social Pinpoint community engagement site
 class Scraper
-  BASE_URL = "https://rockingham.wa.gov.au"
   LISTING_URL = "https://yourthoughts.rockingham.wa.gov.au/town-planning-advertising-and-submissions"
   STATE = "WA"
+
+  # Common street types, used to split titles that lack a " - " separator
+  STREET_TYPES = /(?:Road|Street|Lane|Avenue|Loop|Drive|Way|Court|Place|Crescent|Terrace|Close|Parade|
+                     Boulevard|Esplanade|Highway)/xi
 
   def clean_whitespace(text)
     text.gsub("\r", " ").gsub("\n", " ").squeeze(" ").strip
@@ -66,7 +71,7 @@ class Scraper
 
     # Truncate to 49 chars and add hyphen if truncated
     if sanitized.length > 49
-      sanitized[0..48] + "-"
+      "#{sanitized[0..48]}-"
     else
       sanitized
     end
@@ -78,24 +83,9 @@ class Scraper
       agent.get(info_url)
     end
 
-    # Look for the Proposal section
-    proposal_heading = detail_page.search("h2").find { |h2| h2.text.strip =~ /\AProposal\z/i }
+    content = proposal_content(detail_page, address_snippet)
+    return nil if content.nil?
 
-    unless proposal_heading
-      puts "  No Proposal section found"
-      return nil
-    end
-
-    # Get the next paragraph after the Proposal heading
-    next_p = proposal_heading.next_element
-    next_p = next_p.next_element while next_p && next_p.name != "p"
-
-    unless next_p
-      puts "  No paragraph after Proposal heading"
-      return nil
-    end
-
-    content = next_p.text
     escaped_snippet = Regexp.escape(address_snippet)
 
     if ENV["DEBUG"]
@@ -127,6 +117,39 @@ class Scraper
     nil
   end
 
+  # Text of the blocks following the "Proposal" heading (h3 inside
+  # div.hive-block-heading on the Social Pinpoint site; h2 on the old council
+  # site), up to the next heading block or the address snippet being found
+  def proposal_content(detail_page, address_snippet)
+    proposal_heading = detail_page.search("h2, h3").find { |heading| heading.text.strip =~ /\AProposal\z/i }
+
+    unless proposal_heading
+      puts "  No Proposal section found"
+      return nil
+    end
+
+    node = proposal_heading
+    node = node.parent if node.parent&.attr("class").to_s.include?("hive-block-heading")
+    content = +""
+    while (node = node.next_element)
+      break if node.at("h2, h3") || node.name =~ /\Ah[23]\z/
+
+      content << " " << node.text
+      break if content =~ /#{Regexp.escape(address_snippet)}/i
+    end
+    content
+  end
+
+  # Titles are usually "Description - Address" but some omit the separator,
+  # e.g. "Proposed Holiday House Greenock Road, Baldivis"
+  def split_title(title)
+    return [::Regexp.last_match(1).strip, ::Regexp.last_match(2).strip] if title =~ /\A(.+?)\s+-\s+(.+)\z/
+    return [::Regexp.last_match(1).strip, ::Regexp.last_match(2).strip] if
+      title =~ /\A(.+)\s+([A-Z][\w'-]*\s+#{STREET_TYPES},?\s.*)\z/o
+
+    nil
+  end
+
   def run
     agent = Mechanize.new
     agent.verify_mode = OpenSSL::SSL::VERIFY_NONE
@@ -136,62 +159,61 @@ class Scraper
       agent.get(LISTING_URL)
     end
 
-    cards = page.search("a.hotbox")
+    cards = page.search("article.h-entry.project.card")
     added = found = 0
 
     cards.each do |card|
+      title = clean_whitespace(card["data-project-name"] || card.at("h4")&.text.to_s)
+      link = card.at("a")
+      # Skip the javascript <%- ... %> template stubs embedded in the page
+      next if title.empty? || title.include?("<%") || link.nil?
+
+      category = card["data-project-category"].to_s
+      next unless category.empty? || category.include?("Town Planning")
+
       found += 1
-
-      href = card["href"]
-      info_url = "#{BASE_URL}#{href}"
-
-      # Get title from h4
-      title_elem = card.at("h4")
-      next unless title_elem
-
-      title = clean_whitespace(title_elem.text)
-
-      # Parse title: "Description - Address" format
-      unless title =~ /\A(.+?)\s+-\s+(.+)\z/
-        puts "Warning - Unable to parse title format: #{title} (skipped)"
-        next
-      end
-
-      description = ::Regexp.last_match(1).strip
-      address_snippet = ::Regexp.last_match(2).strip
-
-      # Generate council reference from full title
-      council_reference = generate_council_reference(title)
-
-      # Extract closing date from paragraph
-      on_notice_to = nil
-      para = card.at("p")
-      if para
-        text = clean_whitespace(para.text)
-        on_notice_to = parse_date(::Regexp.last_match(1)) if text =~ /Submissions close\s+(.+)\./
-      end
-
-      # Fetch detail page to get better address
-      address = extract_address_from_details(agent, info_url, address_snippet) || address_snippet
-      address = "#{address}, #{STATE}" unless address.end_with?(" #{STATE}")
-
-      record = {
-        "council_reference" => council_reference,
-        "address" => address,
-        "description" => description,
-        "info_url" => info_url,
-        "date_scraped" => Date.today.to_s,
-      }
-      record["on_notice_to"] = on_notice_to if on_notice_to
-
-      added += 1
-      puts "Saving record #{council_reference} - #{address}"
-      ScraperWiki.save_sqlite(["council_reference"], record)
+      added += 1 if process_card(agent, card, title, URI.join(LISTING_URL, link["href"]).to_s)
     end
 
     cleanup_old_records
     skipped = found - added
     puts "Finished! Added #{added} applications, and skipped #{skipped} unprocessable applications."
+  end
+
+  def process_card(agent, card, title, info_url)
+    # Parse title: "Description - Address" format
+    description, address_snippet = split_title(title)
+    if description.nil?
+      puts "Warning - Unable to parse title format: #{title} (skipped)"
+      return false
+    end
+
+    # Extract closing date from the card summary
+    on_notice_to = nil
+    summary = card.at(".card-summary")
+    if summary
+      text = clean_whitespace(summary.text)
+      on_notice_to = parse_date(::Regexp.last_match(1)) if text =~ /Submissions close(?:d on)?\s+(.+?)\./
+    end
+
+    # Fetch detail page to get better address
+    address = extract_address_from_details(agent, info_url, address_snippet) || address_snippet
+    address = "#{address}, #{STATE}" unless address.end_with?(" #{STATE}")
+
+    # Generate council reference from full title
+    council_reference = generate_council_reference(title)
+    record = {
+      "council_reference" => council_reference,
+      "address" => address,
+      "description" => description,
+      "info_url" => info_url,
+      "date_scraped" => Date.today.to_s,
+    }
+    record["on_notice_to"] = on_notice_to if on_notice_to
+
+    puts "Saving record #{council_reference} - #{address}"
+    ScraperWiki.save_sqlite(["council_reference"], record)
+    true
   end
 end
 
